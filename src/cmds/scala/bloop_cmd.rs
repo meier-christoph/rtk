@@ -337,7 +337,7 @@ fn filter_bloop_compile(output: &str) -> String {
             if let Some(hint) =
                 crate::core::tee::force_tee_hint(output, &format!("bloop-compile-{label}"))
             {
-                summary.push_str(&format!("  {hint}\n"));
+                summary.push_str(&format!("{hint}\n"));
             }
         }
     }
@@ -891,7 +891,7 @@ impl TestRun {
                 self.failures.len() - MAX_FAILURES
             ));
             if let Some(hint) = crate::core::tee::force_tee_hint(output, "bloop-test-failures") {
-                result.push_str(&format!("  {hint}\n"));
+                result.push_str(&format!("{hint}\n"));
             }
         }
         result.trim().to_string()
