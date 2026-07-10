@@ -668,6 +668,15 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        pattern: r"^bloop\s+(test|compile|run)",
+        rtk_cmd: "rtk bloop",
+        rewrite_prefixes: &["bloop"],
+        category: "Build",
+        savings_pct: 85.0,
+        subcmd_savings: &[("test", 90.0), ("compile", 65.0)],
+        subcmd_status: &[],
+    },
+    RtkRule {
         pattern: r"^brew\s+(install|upgrade)\b",
         rtk_cmd: "rtk brew",
         rewrite_prefixes: &["brew"],
