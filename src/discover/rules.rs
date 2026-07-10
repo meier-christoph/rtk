@@ -678,6 +678,17 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
+        pattern: r"^bloop\s+(test|compile|run)",
+        rtk_cmd: "rtk bloop",
+        rewrite_prefixes: &["bloop"],
+        category: "Build",
+        savings_pct: 85.0,
+        subcmd_savings: &[("test", 90.0), ("compile", 65.0)],
+        subcmd_status: &[],
+        // TODO(#3128): when the `pipeline_final_safe` field lands on RtkRule, set it
+        // to `false` here — bloop is a build tool, not a stdin pipeline filter.
+    },
+    RtkRule {
         pattern: r"^brew\s+(install|upgrade)\b",
         rtk_cmd: "rtk brew",
         rewrite_prefixes: &["brew"],
