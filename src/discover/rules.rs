@@ -664,7 +664,7 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
-        pattern: r"^bloop\s+(test|compile|run)",
+        pattern: r"^bloop\s+(test|compile|run)(?:\s|$)",
         rtk_cmd: "rtk bloop",
         rewrite_prefixes: &["bloop"],
         category: "Build",
