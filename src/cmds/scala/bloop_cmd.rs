@@ -15,103 +15,112 @@ use crate::core::runner::{self, RunOptions};
 use crate::core::truncate::{CAP_ERRORS, CAP_LIST, CAP_WARNINGS};
 use crate::core::utils::{resolved_command, strip_ansi, truncate};
 use anyhow::Result;
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::sync::LazyLock;
 
-lazy_static! {
-    /// `Compiling <project> (N Scala sources)` — N captured. A mixed module also
-    /// lists Java sources (`(67 Scala sources and 8 Java sources)`); the optional
-    /// second group captures that count so both are summed into the total.
-    static ref COMPILING_RE: Regex =
-        Regex::new(r"^Compiling \S+ \((\d+) Scala sources?(?: and (\d+) Java sources?)?\)").unwrap();
+/// `Compiling <project> (N Scala sources)` — N captured. A mixed module also
+/// lists Java sources (`(67 Scala sources and 8 Java sources)`); the optional
+/// second group captures that count so both are summed into the total.
+static COMPILING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^Compiling \S+ \((\d+) Scala sources?(?: and (\d+) Java sources?)?\)").unwrap()
+});
 
-    /// `Compiled <project> (Nms)` — value and unit captured. Bloop reports ms
-    /// today; the seconds form (`(1.5s)`) is accepted too so a format change
-    /// can't silently drop a project from the source/time tally.
-    static ref COMPILED_RE: Regex =
-        Regex::new(r"^Compiled \S+ \((\d+(?:\.\d+)?)(ms|s)\)").unwrap();
+/// `Compiled <project> (Nms)` — value and unit captured. Bloop reports ms
+/// today; the seconds form (`(1.5s)`) is accepted too so a format change
+/// can't silently drop a project from the source/time tally.
+static COMPILED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Compiled \S+ \((\d+(?:\.\d+)?)(ms|s)\)").unwrap());
 
-    /// Error diagnostic header: `[E] [E2] path/File.scala:LINE:COL` — loc captured.
-    static ref DIAG_HEADER_RE: Regex =
-        Regex::new(r"^\[E\] \[E\d+\] (.+:\d+:\d+)\s*$").unwrap();
+/// Error diagnostic header: `[E] [E2] path/File.scala:LINE:COL` — loc captured.
+static DIAG_HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[E\] \[E\d+\] (.+:\d+:\d+)\s*$").unwrap());
 
-    /// Warning diagnostic header: `[W]  [E1] path/File.scala:LINE:COL` — loc
-    /// captured. Same shape as the error header but `[W]`-marked (bloop pads it
-    /// with an extra space); body lines are `[W]`-prefixed.
-    static ref WARN_HEADER_RE: Regex =
-        Regex::new(r"^\[W\]\s+\[E\d+\] (.+:\d+:\d+)\s*$").unwrap();
+/// Warning diagnostic header: `[W]  [E1] path/File.scala:LINE:COL` — loc
+/// captured. Same shape as the error header but `[W]`-marked (bloop pads it
+/// with an extra space); body lines are `[W]`-prefixed.
+static WARN_HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[W\]\s+\[E\d+\] (.+:\d+:\d+)\s*$").unwrap());
 
-    /// Source-snippet line inside a diagnostic: `[E]      L42:   def y = ...`.
-    /// Reaching one ends the human-readable message for the current diagnostic.
-    static ref DIAG_SOURCE_RE: Regex = Regex::new(r"^L\d+:").unwrap();
+/// Source-snippet line inside a diagnostic: `[E]      L42:   def y = ...`.
+/// Reaching one ends the human-readable message for the current diagnostic.
+static DIAG_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^L\d+:").unwrap());
 
-    /// Runs of 2+ spaces inside a diagnostic message. bloop right-pads labels
-    /// (`Found:    (...)`); collapse them so the joined one-liner reads cleanly.
-    static ref MULTISPACE_RE: Regex = Regex::new(r" {2,}").unwrap();
+/// Runs of 2+ spaces inside a diagnostic message. bloop right-pads labels
+/// (`Found:    (...)`); collapse them so the joined one-liner reads cleanly.
+static MULTISPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}").unwrap());
 
-    /// Per-suite tally line, e.g. `4 tests, 2 passed, 2 failed`. Only the leading
-    /// `N tests,` shape matches here; individual counts are pulled out with the
-    /// `N_*_RE` regexes so the order and presence of trailing terms don't matter.
-    static ref TALLY_RE: Regex = Regex::new(r"^\d+ tests?,").unwrap();
-    static ref N_PASSED_RE: Regex = Regex::new(r"(\d+) passed").unwrap();
-    static ref N_FAILED_RE: Regex = Regex::new(r"(\d+) failed").unwrap();
-    static ref N_IGNORED_RE: Regex = Regex::new(r"(\d+) ignored").unwrap();
-    /// specs2 counts *errored* examples (uncaught exceptions) separately from
-    /// *failed* (assertion) ones: `4 tests, 3 passed, 1 errors`. Without this an
-    /// error-only suite filters to all-green — a false negative.
-    static ref N_ERRORS_RE: Regex = Regex::new(r"(\d+) errors?").unwrap();
+/// Per-suite tally line, e.g. `4 tests, 2 passed, 2 failed`. Only the leading
+/// `N tests,` shape matches here; individual counts are pulled out with the
+/// `N_*_RE` regexes so the order and presence of trailing terms don't matter.
+static TALLY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+ tests?,").unwrap());
+static N_PASSED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) passed").unwrap());
+static N_FAILED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) failed").unwrap());
+static N_IGNORED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) ignored").unwrap());
 
-    /// A Java stack frame's source location: `pkg.Class.method(File.scala:line)`
-    /// — captures the inner `File.scala:line`. Used to attach a throw-site
-    /// location to an uncaught-exception failure (ScalaTest / zio-test `error`).
-    static ref PAREN_LOC_RE: Regex = Regex::new(r"\(([^()]+:\d+)\)").unwrap();
+/// specs2 counts *errored* examples (uncaught exceptions) separately from
+/// *failed* (assertion) ones: `4 tests, 3 passed, 1 errors`. Without this an
+/// error-only suite filters to all-green — a false negative.
+static N_ERRORS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+) errors?").unwrap());
 
-    /// A line that looks like a JVM throwable: a dotted FQ class name optionally
-    /// followed by `: message`. The zio-test *defect* body is exactly this shape
-    /// following a `- <name>` bullet; requiring it stops ScalaTest FunSpec scope
-    /// headers (`#withName`, `* <summary>`) — which also follow `- <name>` —
-    /// from being mis-read as defect failures.
-    static ref EXCEPTION_LINE_RE: Regex =
-        Regex::new(r"^[\w$]+(?:\.[\w$]+)+\s*(?::|$)").unwrap();
+/// A Java stack frame's source location: `pkg.Class.method(File.scala:line)`
+/// — captures the inner `File.scala:line`. Used to attach a throw-site
+/// location to an uncaught-exception failure (ScalaTest / zio-test `error`).
+static PAREN_LOC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(([^()]+:\d+)\)").unwrap());
 
-    /// A specs2 `[E]` reason often trails junk after the first `(File:line)`
-    /// (e.g. `… / by zero (Calculator.scala:8)example.Calculator$.div(…)`);
-    /// keep everything up to and including that first location.
-    static ref SPECS2_REASON_RE: Regex = Regex::new(r"^(.*?\([^()]+:\d+\))").unwrap();
+/// A line that looks like a JVM throwable: a dotted FQ class name optionally
+/// followed by `: message`. The zio-test *defect* body is exactly this shape
+/// following a `- <name>` bullet; requiring it stops ScalaTest FunSpec scope
+/// headers (`#withName`, `* <summary>`) — which also follow `- <name>` —
+/// from being mis-read as defect failures.
+static EXCEPTION_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[\w$]+(?:\.[\w$]+)+\s*(?::|$)").unwrap());
 
-    /// munit failure marker (bloop test runner):
-    /// `==> X <test name> <dur> <ExceptionType>: <location-or-message>`
-    static ref MUNIT_FAIL_RE: Regex =
-        Regex::new(r"^==> X (.+?) \d+(?:\.\d+)?m?s (\S+): (.*)$").unwrap();
+/// A specs2 `[E]` reason often trails junk after the first `(File:line)`
+/// (e.g. `… / by zero (Calculator.scala:8)example.Calculator$.div(…)`);
+/// keep everything up to and including that first location.
+static SPECS2_REASON_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.*?\([^()]+:\d+\))").unwrap());
 
-    /// A bare `path:line[:col]` location (no whitespace) — used to shorten an
-    /// absolute source path to its basename for compact failure details.
-    static ref LOCATION_RE: Regex = Regex::new(r"^\S+:\d+(?::\d+)?$").unwrap();
+/// munit failure marker (bloop test runner):
+/// `==> X <test name> <dur> <ExceptionType>: <location-or-message>`
+static MUNIT_FAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^==> X (.+?) \d+(?:\.\d+)?m?s (\S+): (.*)$").unwrap());
 
-    /// Footer success line: `All N test suites passed.` — N captured.
-    static ref ALL_SUITES_RE: Regex =
-        Regex::new(r"^All (\d+) test suites? passed\.").unwrap();
+/// A bare `path:line[:col]` location (no whitespace) — used to shorten an
+/// absolute source path to its basename for compact failure details.
+static LOCATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\S+:\d+(?::\d+)?$").unwrap());
 
-    /// Footer timing line: `Total duration: 0.41s` — value captured.
-    static ref TOTAL_DURATION_RE: Regex = Regex::new(r"^Total duration: (\S+)").unwrap();
+/// Footer success line: `All N test suites passed.` — N captured.
+static ALL_SUITES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^All (\d+) test suites? passed\.").unwrap());
 
-    /// Unit shapes bloop prints for `Total duration:`, normalized via
-    /// `parse_duration_ms`: plain ms, fractional seconds, minutes+seconds.
-    static ref DUR_MS_RE: Regex = Regex::new(r"^(\d+)ms$").unwrap();
-    static ref DUR_SEC_RE: Regex = Regex::new(r"^(\d+(?:\.\d+)?)s$").unwrap();
-    static ref DUR_MIN_SEC_RE: Regex = Regex::new(r"^(\d+)m(\d+(?:\.\d+)?)s$").unwrap();
+/// Footer timing line: `Total duration: 0.41s` — value captured.
+static TOTAL_DURATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Total duration: (\S+)").unwrap());
 
-    /// ziotest run summary: `2 tests passed. ...`. Marks the end of the per-test
-    /// tree; everything after is a redundant re-dump, so detail capture stops here.
-    static ref ZIO_SUMMARY_RE: Regex = Regex::new(r"^\d+ tests? passed\.").unwrap();
+/// Unit shapes bloop prints for `Total duration:`, normalized via
+/// `parse_duration_ms`: plain ms, fractional seconds, minutes+seconds.
+static DUR_MS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)ms$").unwrap());
+static DUR_SEC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+(?:\.\d+)?)s$").unwrap());
+static DUR_MIN_SEC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+)m(\d+(?:\.\d+)?)s$").unwrap());
 
-    /// Compile-server banner / footer noise to drop from `run` output.
-    static ref NOISE_RE: Regex = Regex::new(
-        r"^(Starting compilation server|Bloop server started\.|The test execution was successfully closed\.|=+)$"
-    ).unwrap();
-}
+/// ziotest run summary: `2 tests passed. ...`. Marks the end of the per-test
+/// tree; everything after is a redundant re-dump, so detail capture stops here.
+static ZIO_SUMMARY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d+ tests? passed\.").unwrap());
+
+/// Compile-server banner / footer noise to drop from `run` output.
+static NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(Starting compilation server|Bloop server started\.|The test execution was successfully closed\.|=+)$",
+    )
+    .unwrap()
+});
 
 pub fn run_test(args: &[String], verbose: u8) -> Result<i32> {
     run_bloop_filtered("test", args, verbose, filter_bloop_test)
